@@ -1,0 +1,11 @@
+# Local Python deps to run generate_attack_script.py / replay_attack.py
+# from your own machine - NOT a Lambda package (see
+# functions/orchestrator/requirements.txt for that), no manylinux/cross-
+# platform pinning needed here, just whatever your local OS/Python
+# resolves normally.
+#
+# Same anthropic[bedrock] pin as the orchestrator, for the same reason
+# (pinning to avoid a multi-minute pip backtracking resolve) - keep both
+# files' pin in sync if you ever bump one.
+anthropic[bedrock]==0.125.0
+requests

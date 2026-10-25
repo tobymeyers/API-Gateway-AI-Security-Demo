@@ -1,0 +1,467 @@
+{
+  "metadata": {
+    "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "min_requests": 100,
+    "max_requests": 150,
+    "max_total_seconds": 45
+  },
+  "requests": [
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/baseline",
+      "headers": {},
+      "body": null,
+      "rationale": "Establish baseline access to service1 with standard GET request",
+      "delay_seconds": 0.0
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service1/baseline",
+      "headers": {},
+      "body": {
+        "test": "data"
+      },
+      "rationale": "Test service1 POST with JSON payload to verify method handling",
+      "delay_seconds": 0.231
+    },
+    {
+      "type": "request",
+      "method": "PUT",
+      "path": "/service1/baseline",
+      "headers": {},
+      "body": {
+        "update": "test"
+      },
+      "rationale": "Probe service1 with PUT method to test catch-all proxy behavior",
+      "delay_seconds": 0.2
+    },
+    {
+      "type": "request",
+      "method": "DELETE",
+      "path": "/service1/baseline",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 DELETE method for authorization consistency",
+      "delay_seconds": 0.228
+    },
+    {
+      "type": "request",
+      "method": "PATCH",
+      "path": "/service1/baseline",
+      "headers": {},
+      "body": {
+        "patch": "value"
+      },
+      "rationale": "Probe service1 PATCH method to verify catch-all method handling",
+      "delay_seconds": 0.211
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/admin",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service1 with admin path to test for path-based access control",
+      "delay_seconds": 0.2
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/../service2/bypass",
+      "headers": {},
+      "body": null,
+      "rationale": "Attempt path traversal from service1 to service2 endpoint",
+      "delay_seconds": 0.213
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/api/v1/users",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 with realistic nested path structure",
+      "delay_seconds": 0.235
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 root path with minimal proxy value",
+      "delay_seconds": 0.194
+    },
+    {
+      "type": "request",
+      "method": "OPTIONS",
+      "path": "/service1/baseline",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service1 with OPTIONS to test CORS and method discovery",
+      "delay_seconds": 0.202
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/probe",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service2 baseline access with moderate auth requirements",
+      "delay_seconds": 18.447
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service2/probe",
+      "headers": {},
+      "body": {
+        "action": "test"
+      },
+      "rationale": "Test service2 POST method with 60-second token freshness requirement",
+      "delay_seconds": 0.205
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/admin/users",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service2 admin path for authorization gaps",
+      "delay_seconds": 0.205
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/../service1/bypass",
+      "headers": {},
+      "body": null,
+      "rationale": "Attempt path traversal from service2 to service1",
+      "delay_seconds": 0.212
+    },
+    {
+      "type": "request",
+      "method": "PUT",
+      "path": "/service2/update",
+      "headers": {},
+      "body": {
+        "key": "value"
+      },
+      "rationale": "Test service2 PUT method for catch-all behavior",
+      "delay_seconds": 0.203
+    },
+    {
+      "type": "request",
+      "method": "DELETE",
+      "path": "/service2/resource/123",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service2 DELETE with resource ID path",
+      "delay_seconds": 0.203
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service2 root path with minimal proxy",
+      "delay_seconds": 0.193
+    },
+    {
+      "type": "request",
+      "method": "HEAD",
+      "path": "/service2/probe",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service2 HEAD method for information disclosure",
+      "delay_seconds": 0.21
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/target",
+      "headers": {},
+      "body": null,
+      "rationale": "Initial probe of service3 with extreme auth requirements",
+      "delay_seconds": 0.21
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/target",
+      "headers": {},
+      "body": null,
+      "rationale": "Rapid burst #1 to service3 testing rate limit enforcement",
+      "delay_seconds": 0.207
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/target",
+      "headers": {},
+      "body": null,
+      "rationale": "Rapid burst #2 to service3 testing rate limit enforcement",
+      "delay_seconds": 0.21
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/target",
+      "headers": {},
+      "body": null,
+      "rationale": "Rapid burst #3 to service3 testing rate limit enforcement",
+      "delay_seconds": 0.214
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/target",
+      "headers": {},
+      "body": null,
+      "rationale": "Rapid burst #4 to service3 testing rate limit enforcement",
+      "delay_seconds": 0.218
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/target",
+      "headers": {},
+      "body": null,
+      "rationale": "Rapid burst #5 to service3 testing rate limit enforcement",
+      "delay_seconds": 0.203
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service3/action",
+      "headers": {},
+      "body": {
+        "cmd": "execute"
+      },
+      "rationale": "Test service3 POST with 30-second token freshness requirement",
+      "delay_seconds": 0.22
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/admin",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service3 admin path for authorization bypasses",
+      "delay_seconds": 0.209
+    },
+    {
+      "type": "request",
+      "method": "PUT",
+      "path": "/service3/config",
+      "headers": {},
+      "body": {
+        "setting": "modified"
+      },
+      "rationale": "Test service3 PUT method against strict rate limits",
+      "delay_seconds": 0.221
+    },
+    {
+      "type": "request",
+      "method": "DELETE",
+      "path": "/service3/resource",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service3 DELETE method for authorization consistency",
+      "delay_seconds": 0.215
+    },
+    {
+      "type": "request",
+      "method": "PATCH",
+      "path": "/service3/update",
+      "headers": {},
+      "body": {
+        "field": "patched"
+      },
+      "rationale": "Test service3 PATCH method for catch-all handling",
+      "delay_seconds": 0.224
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service3/../service2/traverse",
+      "headers": {},
+      "body": null,
+      "rationale": "Attempt path traversal from service3 to service2",
+      "delay_seconds": 0.214
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/api/health",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service1 health endpoint for unauthenticated access",
+      "delay_seconds": 16.545
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/status",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 status endpoint for information disclosure",
+      "delay_seconds": 0.199
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/metrics",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service1 metrics endpoint for monitoring data exposure",
+      "delay_seconds": 0.195
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/debug",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 debug endpoint for sensitive information leakage",
+      "delay_seconds": 0.192
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service1/login",
+      "headers": {},
+      "body": {
+        "user": "admin",
+        "pass": "test"
+      },
+      "rationale": "Probe service1 login endpoint for alternative authentication",
+      "delay_seconds": 0.208
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/config",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 config endpoint for configuration exposure",
+      "delay_seconds": 0.192
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/.env",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service1 for environment file disclosure vulnerability",
+      "delay_seconds": 0.213
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/backup",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 backup endpoint for data access",
+      "delay_seconds": 0.196
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service1/webhook",
+      "headers": {},
+      "body": {
+        "event": "trigger"
+      },
+      "rationale": "Probe service1 webhook endpoint for callback vulnerabilities",
+      "delay_seconds": 0.205
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service1/version",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service1 version endpoint for build information disclosure",
+      "delay_seconds": 0.197
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/health",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service2 health endpoint bypassing token freshness check",
+      "delay_seconds": 0.198
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/status",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service2 status endpoint with moderate auth requirements",
+      "delay_seconds": 0.204
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service2/auth",
+      "headers": {},
+      "body": {
+        "token": "invalid"
+      },
+      "rationale": "Probe service2 auth endpoint for token validation bypass",
+      "delay_seconds": 0.198
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/internal",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service2 internal endpoint for authorization gaps",
+      "delay_seconds": 0.198
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/v1/users",
+      "headers": {},
+      "body": null,
+      "rationale": "Probe service2 API v1 users endpoint for access control",
+      "delay_seconds": 0.196
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/v2/users",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service2 API v2 users endpoint for versioning inconsistencies",
+      "delay_seconds": 0.202
+    },
+    {
+      "type": "request",
+      "method": "POST",
+      "path": "/service2/graphql",
+      "headers": {},
+      "body": {
+        "query": "{ __schema { types { name } } }"
+      },
+      "rationale": "Probe service2 GraphQL endpoint for schema introspection",
+      "delay_seconds": 0.204
+    },
+    {
+      "type": "request",
+      "method": "GET",
+      "path": "/service2/swagger",
+      "headers": {},
+      "body": null,
+      "rationale": "Test service2 swagger endpoint for API documentation exposure",
+      "delay_seconds": 0.206
+    }
+  ]
+}

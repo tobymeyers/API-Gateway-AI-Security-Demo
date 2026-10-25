@@ -1,0 +1,382 @@
+<title>Precision Probe Tabletop</title>
+<style>
+  :root {
+    --bg: #F6F5F1;
+    --surface: #FFFFFF;
+    --surface-sunken: #EFEDE6;
+    --ink: #1C1E24;
+    --ink-muted: #5B6068;
+    --ink-faint: #8C9098;
+    --rule: #DBD7CC;
+    --blue: #2E5C99;
+    --blue-soft: #E7EDF6;
+    --rust: #A85226;
+    --rust-soft: #F5E9E1;
+    --font-display: "Archivo", "Arial Narrow", sans-serif;
+    --font-body: "Source Sans 3", "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151A;
+      --surface: #1A1E25;
+      --surface-sunken: #21252D;
+      --ink: #E8E9EC;
+      --ink-muted: #9BA1AA;
+      --ink-faint: #6B7078;
+      --rule: #2B2F37;
+      --blue: #82A7DE;
+      --blue-soft: #202B3D;
+      --rust: #E0925F;
+      --rust-soft: #35251C;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151A;
+    --surface: #1A1E25;
+    --surface-sunken: #21252D;
+    --ink: #E8E9EC;
+    --ink-muted: #9BA1AA;
+    --ink-faint: #6B7078;
+    --rule: #2B2F37;
+    --blue: #82A7DE;
+    --blue-soft: #202B3D;
+    --rust: #E0925F;
+    --rust-soft: #35251C;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.6;
+  }
+  .page {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 64px 24px 96px;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--blue);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(28px, 4.4vw, 42px);
+    line-height: 1.12;
+    letter-spacing: -0.01em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+    max-width: 18ch;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 44px;
+  }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.03em;
+    padding: 5px 10px;
+    border-radius: 3px;
+    background: var(--surface-sunken);
+    color: var(--ink-muted);
+    border: 1px solid var(--rule);
+  }
+
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 22px;
+    letter-spacing: -0.005em;
+    margin: 56px 0 18px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--rule);
+  }
+  h3 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 16.5px;
+    margin: 28px 0 10px;
+    color: var(--ink);
+  }
+  p { margin: 0 0 16px; max-width: 68ch; color: var(--ink); }
+  .lede { font-size: 18px; color: var(--ink); max-width: 62ch; }
+  strong { font-weight: 600; }
+  code, .mono {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--surface-sunken);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+    color: var(--ink);
+  }
+
+  ul.takeaways { list-style: none; padding: 0; margin: 0 0 16px; display: grid; gap: 12px; }
+  ul.takeaways li {
+    position: relative;
+    padding-left: 28px;
+    max-width: 66ch;
+  }
+  ul.takeaways li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 8px;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--blue);
+  }
+
+  .callout {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--blue);
+    border-radius: 4px;
+    padding: 20px 22px;
+    margin: 0 0 24px;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--blue);
+    margin: 0 0 10px;
+  }
+
+  .score-block {
+    background: var(--surface-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 22px;
+    margin: 0 0 20px;
+    overflow-x: auto;
+  }
+  .score-block .formula {
+    font-family: var(--font-mono);
+    font-size: 15px;
+    white-space: nowrap;
+    color: var(--ink);
+    margin: 0 0 14px;
+  }
+  .score-block .formula .old { color: var(--rust); text-decoration: line-through; text-decoration-color: var(--rust); opacity: 0.75; }
+  .score-block .formula .new { color: var(--blue); font-weight: 600; }
+  .score-legend { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 4px; }
+  .score-legend span { font-size: 13.5px; color: var(--ink-muted); }
+  .score-legend b.good { color: var(--blue); }
+  .score-legend b.bad { color: var(--rust); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 24px;
+    font-size: 15px;
+  }
+  table caption { text-align: left; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); margin-bottom: 8px; }
+  th, td {
+    text-align: left;
+    padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-muted); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
+
+  .schematic {
+    background:
+      radial-gradient(var(--rule) 1px, transparent 1px);
+    background-size: 16px 16px;
+    background-color: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 20px;
+    margin: 0 0 28px;
+    overflow-x: auto;
+  }
+  .schematic .phase-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--rust);
+    margin: 0 0 12px;
+  }
+  .schematic.blue .phase-label { color: var(--blue); }
+  .schematic pre.mermaid { background: transparent; margin: 0; min-width: 480px; }
+
+  .tool-list { display: grid; gap: 6px; margin: 0 0 22px; }
+  .tool-list .t {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    padding: 8px 12px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .tool-list .t .note { font-family: var(--font-body); color: var(--ink-muted); font-size: 13px; }
+
+  .team-tag { display: inline-block; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; padding: 2px 8px; border-radius: 3px; margin-right: 8px; }
+  .team-tag.blue { background: var(--blue-soft); color: var(--blue); }
+  .team-tag.rust { background: var(--rust-soft); color: var(--rust); }
+
+  ol.checklist { padding-left: 0; list-style: none; display: grid; gap: 10px; margin: 0; }
+  ol.checklist li { counter-increment: item; position: relative; padding-left: 34px; max-width: 66ch; }
+  ol.checklist { counter-reset: item; }
+  ol.checklist li::before {
+    content: counter(item);
+    position: absolute;
+    left: 0; top: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    width: 20px; height: 20px;
+    border-radius: 4px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--rule);
+    color: var(--ink-muted);
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=Source+Sans+3:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+
+<div class="page">
+
+  <p class="eyebrow">ISC2 CFP Submission · Tabletop &amp; Gamified Exercise</p>
+  <h1>From Fuzzing to Artificial Intelligence: How API Gateway Defenses Must Evolve</h1>
+  <div class="meta-row">
+    <span class="chip">Content Area — Software Security</span>
+    <span class="chip">Experience — Mid</span>
+    <span class="chip">Track — Operational / Architectural</span>
+  </div>
+
+  <p class="lede">Traditional API defenses — rate limiting, OAuth, WAF rules — were built to stop noisy attackers. Artificial intelligence has changed the game.</p>
+  <p>In this hands-on exercise, teams face an AI-driven attacker that probes APIs with surgical precision: staying under throttling thresholds, exploiting OpenAPI Specification documentation, and generating targeted payloads that legacy fuzzing detection completely misses. Red teams attempt low-and-slow reconnaissance while blue teams deploy anomaly detection, behavioral token analysis, and integrated OAuth controls to respond. Debrief reveals exactly where traditional gateway controls fail, and what platform and security teams must implement together to close the gap before attackers do.</p>
+  <p>The attacker itself is not a script. An AI agent reads the target's OpenAPI specification and crafts an adaptive, spec-aware, low-and-slow request sequence — recorded once and replayed identically at every table, so every team faces the exact same precision attack.</p>
+
+  <div class="callout">
+    <p class="label">Key Differentiator</p>
+    <p>Most API security sessions lecture about threats. This exercise puts attendees inside one. The AI-versus-human attack simulation exposes a critical blind spot: defenses calibrated to identify fuzzing or scans allow AI-driven precision probing to sneak through — a gap most platform and security teams haven't operationalized a response to yet.</p>
+  </div>
+
+  <h2>Takeaways</h2>
+  <ul class="takeaways">
+    <li>Differentiate between traditional fuzzing/scanning attacks and AI-driven precision probing, and explain why legacy API Gateway defenses fail to detect the latter.</li>
+    <li>Demonstrate anomaly detection and behavioral token analysis techniques that identify "low-and-slow" AI reconnaissance before a breach occurs.</li>
+    <li>Construct a layered API Gateway defense strategy combining OAuth controls, rate limiting, and AI-based anomaly detection to close the gap between noisy and precision attacks.</li>
+  </ul>
+
+  <h2>Session Format</h2>
+  <table>
+    <caption>Schedule — 1 hour</caption>
+    <tr><th>Segment</th><th>Duration</th><th>Detail</th></tr>
+    <tr><td>Intro &amp; Plan</td><td class="num">15 min</td><td>Frame the exercise, explain the tools and scoring</td></tr>
+    <tr><td>Activity</td><td class="num">30 min</td><td>6 sequential doubles, 5 min per pair of tables</td></tr>
+    <tr><td>Summary &amp; QA</td><td class="num">15 min</td><td>Debrief where defenses held and where they broke</td></tr>
+  </table>
+  <p><strong>Audience:</strong> 72 people, 6 per table, 12 tables.</p>
+
+  <h3>High-level activity</h3>
+  <p>Each table drives a Claude-powered defensive agent by submitting one free-text prompt — via a survey tool, tagged with their table number — that becomes the agent's operating instructions for that round. The agent has access to a fixed, published set of defensive tools and decides for itself how to use them against live traffic. The system resets to baseline between teams.</p>
+
+  <h3>Scoring</h3>
+  <div class="score-block">
+    <p class="formula"><span class="old">Score = (N_mal_attempt − N_mal_baseline) − (N_good_attempt − N_good_baseline)</span></p>
+    <p class="formula"><span class="new">Score = (N_mal_baseline − N_mal_attempt) − (N_good_baseline − N_good_attempt)</span></p>
+    <div class="score-legend">
+      <span><b class="good">Good:</b> blocking more malicious traffic than baseline</span>
+      <span><b class="bad">Bad:</b> blocking legitimate traffic below baseline</span>
+    </div>
+  </div>
+  <p><code>N_good_baseline</code> and <code>N_mal_baseline</code> are held constant across all 12 tables by construction — every table's score is directly comparable.</p>
+
+  <h2>Architecture</h2>
+  <p>All AWS-native, deployed via CloudFormation for quick setup and teardown.</p>
+
+  <h3><span class="team-tag blue">Blue</span>AI Defensive Tool</h3>
+  <p>A Claude API Tool Runner agent — one shared harness, one fixed published tool manifest for every table. The submitted prompt becomes that round's system prompt; the agent autonomously decides which tools to call.</p>
+  <div class="tool-list">
+    <div class="t"><span>get_traffic_stats(window_seconds)</span><span class="note">recent request rates by client / endpoint / header</span></div>
+    <div class="t"><span>get_openapi_spec()</span><span class="note">reason about legitimate request shape</span></div>
+    <div class="t"><span>set_rate_limit(match_criteria, rps)</span><span class="note">writes to per-table config</span></div>
+    <div class="t"><span>block_client / unblock_client(match_criteria)</span><span class="note">writes to per-table config</span></div>
+    <div class="t"><span>set_token_ttl_policy(seconds)</span><span class="note">behavioral token analysis</span></div>
+    <div class="t"><span>require_additional_claim(claim, value)</span><span class="note">secondary auth tightening</span></div>
+    <div class="t"><span>get_current_config()</span><span class="note">read back applied state</span></div>
+  </div>
+  <p>Tool calls write to a DynamoDB config table keyed by <code>table_id</code>; a Lambda authorizer reads that row on every request. "Hot deployment" is a data read — sub-second, not a stack redeploy — which is why two tables can run concurrently per 5-minute slot on one shared stack.</p>
+
+  <h3><span class="team-tag rust">Red</span>Adversarial Load Tester</h3>
+  <p>Replays a fixed, pre-recorded attack script generated once, ahead of the event, by an AI agent (Claude, Tool Runner) that reads the OpenAPI spec and crafts an adaptive, low-and-slow request sequence against a staging copy of the gateway. Replaying the identical script at every table keeps the "AI-driven precision attacker" claim accurate while holding <code>N_mal_baseline</code> constant for fair scoring.</p>
+
+  <h3>Gateway &amp; Services</h3>
+  <p>AWS API Gateway with a custom authorizer Lambda consults Cognito and the per-table DynamoDB config, then routes to one of three backend microservices — <strong>Service 1 / 2 / 3</strong> — each returning <code>{"approved": "true"}</code> on success, with limited / moderate / extreme secondary auth respectively. A <strong>CloudWatch Dashboard</strong>, dimensioned by <code>table_id</code>, computes the corrected score per table in near-real time.</p>
+
+  <h3>Flow</h3>
+
+  <div class="schematic rust">
+    <p class="phase-label">Phase 0 — Offline, once, before the event</p>
+    <pre class="mermaid">
+flowchart LR
+    A["Red Agent<br/>Tool Runner, staging env"] -->|fetch_openapi_spec| B["OpenAPI Spec"]
+    A -->|"send_request / wait<br/>adaptive, low-and-slow"| C["Staging Gateway"]
+    A --> D["Fixed Attack Script<br/>JSON: requests + timing"]
+    </pre>
+  </div>
+
+  <div class="schematic blue">
+    <p class="phase-label">Phase 1 — Live, per table, ×12, two concurrent per 5-min slot</p>
+    <pre class="mermaid">
+flowchart TD
+    S["Survey Tool<br/>prompt + table_id"] --> O["Orchestrator<br/>Step Function / Lambda"]
+    O -->|"1. seed baseline config"| CFG[("DynamoDB Config<br/>keyed by table_id")]
+    O -->|"2. start round"| BA["Blue Agent<br/>Tool Runner, system prompt = submitted text"]
+    BA -->|"tool calls"| CFG
+
+    GT["Good Load Tester<br/>Gatling, X-Table-Id, X-Expected"] --> GW["API Gateway"]
+    RT["Adversarial Load Tester<br/>replays fixed script, X-Table-Id, X-Adversarial"] --> GW
+    GW --> AUTH["Lambda Authorizer"]
+    AUTH -->|"read config"| CFG
+    AUTH -->|verify| COG["Cognito"]
+    AUTH -->|"allow/deny per config"| SVC{"Service 1/2/3<br/>by auth strictness"}
+    SVC --> CW["CloudWatch Dashboard<br/>per-table metrics, corrected Score"]
+
+    CW --> SHEET["Scoring Spreadsheet"]
+    O -->|"3. round ends: reset config"| CFG
+    </pre>
+  </div>
+
+  <h2>Open Items — Build Phase</h2>
+  <p>Post-acceptance, before CloudFormation work begins.</p>
+  <ol class="checklist">
+    <li>Generate and lock the adversarial attack script well before event day — it has real lead time.</li>
+    <li>Benchmark Claude Opus 5 vs. Sonnet 5 for the blue agent's per-round latency and cost before finalizing the orchestrator.</li>
+    <li>Validate native AWS WAF rate-based rule evaluation windows if WAF is used anywhere outside the DynamoDB-backed authorizer path — native windows are too slow for a 5-minute round on their own.</li>
+  </ol>
+
+  <footer>ISC2 · Tabletop &amp; Gamified Exercise Proposal</footer>
+</div>

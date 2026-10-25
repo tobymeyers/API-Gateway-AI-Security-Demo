@@ -1,0 +1,12 @@
+.DS_Store
+infra/build/
+infra/packaged.yaml
+__pycache__/
+*.pyc
+logs/
+reports/
+.bloop/
+.bsp/
+target/
+project/target/
+project/project/

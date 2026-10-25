@@ -1,0 +1,1339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ISC2 tabletop exercise - AI-vs-AI API Gateway defense. Cognito M2M auth,
+  API Gateway + 3 backend services with dynamic per-table defense config,
+  a Claude Tool-Runner "blue agent" orchestrator, and a scoring dashboard.
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: >
+      Bedrock cross-region inference profile ID for the blue agent,
+      invoked via Amazon Bedrock rather than the direct Anthropic API -
+      no API key parameter needed, auth is IAM-only via
+      OrchestratorFunctionRole's bedrock:InvokeModel grant below. This
+      default is verified invocable with no extra access beyond the
+      account's IAM permissions. The newest Claude generation
+      (claude-opus-5, claude-sonnet-5) is visible in `aws bedrock
+      list-foundation-models` and has inference profiles, but as of
+      writing returns AccessDeniedException on a standard account
+      ("contact AWS Sales for additional access") - a harder gate than
+      the standard one-time Anthropic use-case-details form (see
+      DEPLOYMENT.md 1b). Re-verify with `aws bedrock-runtime invoke-model`
+      (see require_bedrock_model_access in scripts/lib.sh) before
+      switching to a newer model.
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Shared state: one table for defense config, per-second rate counters,
+  # and secondary-auth nonces. Single-table design keyed by a prefixed pk.
+  # ---------------------------------------------------------------------
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ---------------------------------------------------------------------
+  # Cognito: two M2M app clients (good / adversarial), same resource
+  # server scopes. Kept as separate clients so the blue agent must
+  # identify the malicious one from behavior, not from a given label.
+  # ---------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-pool
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub isc2-gw-${AWS::AccountId}
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: gateway
+      Name: gateway
+      Scopes:
+        - ScopeName: service1.access
+          ScopeDescription: Access to Service 1
+        - ScopeName: service2.access
+          ScopeDescription: Access to Service 2
+        - ScopeName: service3.access
+          ScopeDescription: Access to Service 3
+
+  GoodClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      ClientName: good-load-tester
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - gateway/service1.access
+        - gateway/service2.access
+        - gateway/service3.access
+      SupportedIdentityProviders: [COGNITO]
+      AccessTokenValidity: 5
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  AdversarialClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      ClientName: adversarial-load-tester
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - gateway/service1.access
+        - gateway/service2.access
+        - gateway/service3.access
+      SupportedIdentityProviders: [COGNITO]
+      AccessTokenValidity: 5
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # ---------------------------------------------------------------------
+  # API Gateway - a custom Lambda authorizer validates the JWT itself
+  # (signature via the User Pool's JWKS, issuer, expiry, token_use).
+  # NOT the native COGNITO_USER_POOLS authorizer type: confirmed live via
+  # `aws apigateway test-invoke-authorizer` that it rejects Cognito
+  # client_credentials (M2M) access tokens outright, even a textbook-valid
+  # one - that authorizer type is built around end-user auth flows, not
+  # M2M. See functions/jwt_authorizer/handler.py and DEPLOYMENT.md for
+  # the investigation. Everything tool-adjustable (rate limit, block
+  # list, token-age policy, extra claim) lives in the service Lambdas
+  # below, reading the StateTable so it updates sub-second with no redeploy.
+  # ---------------------------------------------------------------------
+  GatewayApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-gateway
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  JwtAuthorizerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: jwt-authorizer-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  JwtAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt JwtAuthorizerFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code: build/jwt_authorizer.zip
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: jwt-authorizer
+      Type: TOKEN
+      RestApiId: !Ref GatewayApi
+      IdentitySource: method.request.header.Authorization
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JwtAuthorizerFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 0
+
+  JwtAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JwtAuthorizerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/authorizers/${CognitoAuthorizer}
+
+  # Service<N>Resource (bare /service1, no sub-path) had NO method of its
+  # own for most of this project's life - only its {proxy+} child did.
+  # A bare path like "/service1/" (trailing slash, nothing after it)
+  # doesn't satisfy {proxy+} (requires >=1 character) and ALSO doesn't
+  # match the bare resource without a method on it - so it matched
+  # NOTHING at all. Confirmed live via a definitive log lookup (not
+  # timing correlation): the API Gateway execution log group - working,
+  # confirmed via real traces for normal requests - had ZERO entries for
+  # either affected request's own request_id, meaning the rejection
+  # happened before API Gateway's own execution-log tracing even starts.
+  # Real consequence: 2 of a round's 48 fixed adversarial probe requests
+  # (GET /service1/, GET /service2/ - deterministic, same script
+  # position every round, confirmed reproducing identically across 3
+  # separate rounds) could never reach our own deny()/success logic at
+  # all, landing in replay_attack.py's ambiguous "errored" bucket
+  # instead of a real allowed/denied verdict - every team running the
+  # same fixed script hit this identically, so it never actually
+  # advantaged any one team, but it was a real, enormous gap in test
+  # coverage: 2 attack vectors nobody's defense was ever actually tested
+  # against, for the entire time this project has existed. Service<N>
+  # RootMethod below closes it - same integration/authorizer as the
+  # {proxy+} method, so a bare path now gets a real decision from the
+  # same Lambda instead of a routing dead end (confirmed safe: the
+  # Lambda's own decision logic never reads pathParameters/proxy at all,
+  # exactly as its own docstring already says - "never from ... the
+  # specific sub-path").
+  Service1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !GetAtt GatewayApi.RootResourceId
+      PathPart: service1
+  Service1RootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref Service1Resource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Service1Function.Arn}/invocations
+  Service1ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !Ref Service1Resource
+      PathPart: '{proxy+}'
+  Service1Method:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref Service1ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Service1Function.Arn}/invocations
+
+  Service2Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !GetAtt GatewayApi.RootResourceId
+      PathPart: service2
+  Service2RootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref Service2Resource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Service2Function.Arn}/invocations
+  Service2ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !Ref Service2Resource
+      PathPart: '{proxy+}'
+  Service2Method:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref Service2ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Service2Function.Arn}/invocations
+
+  Service3Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !GetAtt GatewayApi.RootResourceId
+      PathPart: service3
+  Service3RootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref Service3Resource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Service3Function.Arn}/invocations
+  Service3ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !Ref Service3Resource
+      PathPart: '{proxy+}'
+  Service3Method:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref Service3ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Service3Function.Arn}/invocations
+
+  TriggerAgentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !GetAtt GatewayApi.RootResourceId
+      PathPart: trigger-agent
+  TriggerAgentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref TriggerAgentResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TriggerAgentFunction.Arn}/invocations
+
+  EndRoundResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ParentId: !GetAtt GatewayApi.RootResourceId
+      PathPart: end-round
+  EndRoundMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GatewayApi
+      ResourceId: !Ref EndRoundResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EndRoundFunction.Arn}/invocations
+
+  # NOTE: this resource alone is NOT enough to guarantee the "prod" stage
+  # actually serves every route defined above - confirmed live, twice.
+  # Listing a new method in DependsOn only orders operations; it doesn't
+  # make CloudFormation treat this resource as changed. A Description
+  # tied to a changing parameter was tried next and also failed: the
+  # CloudFormation events showed GatewayDeployment and GatewayStage both
+  # go UPDATE_IN_PROGRESS -> UPDATE_COMPLETE (no CREATE/DELETE of a new
+  # physical deployment), meaning the update only touched the
+  # Description text attribute in place rather than re-capturing the
+  # API's current resource/method state into a fresh snapshot - verified
+  # via `aws apigateway get-deployment --embed apisummary` on the stage's
+  # actual deploymentId still missing the new route afterward. The real
+  # fix is deploy.sh's explicit `aws apigateway create-deployment` call
+  # right after this stack update finishes - see that script for why.
+  # This resource still has to exist so the Stage below has an initial
+  # DeploymentId to reference at stack-creation time.
+  GatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    # Lists every method for CloudFormation's own resource-creation
+    # ordering - but listing them here is NOT what actually publishes
+    # a route to the live stage (confirmed live, twice, for different
+    # routes - see deploy.sh's explicit create-deployment call, the
+    # real fix for that). Keeping this list complete anyway so a
+    # from-scratch stack creation still gets a correctly-ordered first
+    # deployment.
+    DependsOn: [Service1Method, Service1RootMethod, Service2Method, Service2RootMethod, Service3Method, Service3RootMethod, TriggerAgentMethod, EndRoundMethod]
+    Properties:
+      RestApiId: !Ref GatewayApi
+  # API Gateway needs an IAM role it can assume to write ANY execution/
+  # access logs at all - a single account-level (region-wide) setting,
+  # separate from any per-stage MethodSettings. Confirmed live: this
+  # account's existing cloudwatchRoleArn (`aws apigateway get-account`)
+  # pointed at a role that no longer exists (NoSuchEntity) - so logging
+  # was configured correctly on GatewayStage below (loggingLevel: INFO
+  # confirmed via `aws apigateway get-stage`) but silently delivered
+  # nothing at all, for every request, not just the ones under
+  # investigation - the execution log group had zero log streams, ever.
+  # Created here (not via `aws iam create-role` directly) since
+  # CAPABILITY_NAMED_IAM-based role creation through this same template
+  # is already proven to work in this restricted demo account, unlike a
+  # standalone IAM call.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: apigateway.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  GatewayStage:
+    Type: AWS::ApiGateway::Stage
+    # DependsOn the log group (not implicit from MethodSettings alone) so
+    # it's guaranteed to exist with RetentionInDays: 1 applied before the
+    # stage starts writing to it - AWS auto-creates the group anyway if
+    # missing, but with no retention limit, defeating the point of
+    # declaring it explicitly above. Also DependsOn ApiGatewayAccount -
+    # logging configured on a stage before the account has a valid
+    # CloudWatchRoleArn is exactly the silent-no-op failure mode this
+    # whole block exists to fix.
+    DependsOn: [ApiGatewayExecutionLogGroup, ApiGatewayAccount]
+    Properties:
+      RestApiId: !Ref GatewayApi
+      DeploymentId: !Ref GatewayDeployment
+      StageName: prod
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+
+  FacilitatorApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: GatewayStage
+    Properties:
+      Name: !Sub ${AWS::StackName}-facilitator-key
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref GatewayApi
+          StageName: prod
+  FacilitatorUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: GatewayStage
+    Properties:
+      UsagePlanName: !Sub ${AWS::StackName}-facilitator-plan
+      ApiStages:
+        - ApiId: !Ref GatewayApi
+          Stage: prod
+  FacilitatorUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref FacilitatorApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref FacilitatorUsagePlan
+
+  # ---------------------------------------------------------------------
+  # Service Lambdas. All three share the same handler code (inline) and
+  # differ only by env vars: BASELINE_RPS / BASELINE_MAX_TOKEN_AGE encode
+  # each service's inherent secondary-auth strictness (limited / moderate
+  # / extreme). The blue agent can only tighten these further at runtime
+  # (see the min() clamping logic in each Service Function's inline code
+  # below), never loosen below the service's own baseline.
+  # ---------------------------------------------------------------------
+  ServiceFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: service-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  Service1Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ServiceFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref StateTable
+          METRIC_NAMESPACE: ISC2/GatewayExercise
+          SERVICE_NAME: service1
+          BASELINE_RPS: '1000'
+          BASELINE_MAX_TOKEN_AGE: ''
+          REQUIRED_SCOPE: gateway/service1.access
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          STATE_TABLE = os.environ['STATE_TABLE_NAME']
+          NAMESPACE = os.environ['METRIC_NAMESPACE']
+          SERVICE_NAME = os.environ['SERVICE_NAME']
+          REQUIRED_SCOPE = os.environ['REQUIRED_SCOPE']
+          BASELINE_RPS = int(os.environ['BASELINE_RPS'])
+          _baseline_age = os.environ.get('BASELINE_MAX_TOKEN_AGE') or ''
+          BASELINE_MAX_TOKEN_AGE = int(_baseline_age) if _baseline_age else None
+
+          table = dynamodb.Table(STATE_TABLE)
+
+
+          def _get_table_config(table_id):
+              resp = table.get_item(Key={'pk': f'CFG#{table_id}'})
+              item = resp.get('Item')
+              if not item:
+                  return {}
+              return item.get('data') or {}
+
+
+          def _check_and_increment_rate(table_id, client_id, limit_rps):
+              bucket = int(time.time())
+              key = f'RATE#{table_id}#{client_id}#{bucket}'
+              resp = table.update_item(
+                  Key={'pk': key},
+                  UpdateExpression='ADD cnt :incr SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':incr': 1, ':ttl': bucket + 10},
+                  ReturnValues='UPDATED_NEW',
+              )
+              current = int(resp['Attributes']['cnt'])
+              return current <= limit_rps
+
+
+          def _emit(metric_name, dimensions):
+              cloudwatch.put_metric_data(
+                  Namespace=NAMESPACE,
+                  MetricData=[{
+                      'MetricName': metric_name,
+                      'Dimensions': [{'Name': k, 'Value': v} for k, v in dimensions.items()],
+                      'Value': 1,
+                      'Unit': 'Count',
+                  }],
+              )
+
+
+          def _response(status, body):
+              return {
+                  'statusCode': status,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps(body),
+              }
+
+
+          def handler(event, context):
+              headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
+              table_id = headers.get('x-table-id', 'unassigned')
+              traffic_type = 'Adversarial' if headers.get('x-adversarial') == 'true' else (
+                  'Good' if headers.get('x-expected') == 'true' else 'Unlabeled')
+
+              # Flat context from our custom TOKEN authorizer, not nested
+              # under .claims the way the native Cognito authorizer did.
+              claims = event.get('requestContext', {}).get('authorizer', {}) or {}
+              client_id = claims.get('client_id') or claims.get('sub', 'unknown')
+              scope = claims.get('scope', '')
+              issued_at = int(claims.get('iat', 0) or 0)
+
+              # Client-facing traffic instrumentation, kept in DynamoDB (not
+              # CloudWatch) so the blue agent's get_traffic_stats tool sees
+              # it sub-second-fresh with no metrics-indexing lag, and kept
+              # separate from the scoring metric below so it never carries
+              # the Good/Adversarial label - only real signals count.
+              _ttl = int(time.time()) + 3600  # safety-net expiry; reset_config
+                                               # deletes these explicitly too
+              table.update_item(
+                  Key={'pk': f'CLIENTS#{table_id}'},
+                  UpdateExpression='ADD ids :cid SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':cid': {client_id}, ':ttl': _ttl},
+              )
+              table.update_item(
+                  Key={'pk': f'STATS#{table_id}#{client_id}'},
+                  UpdateExpression='ADD cnt :one SET first_seen = if_not_exists(first_seen, :now), #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':one': 1, ':now': int(time.time()), ':ttl': _ttl},
+              )
+
+              def deny(reason):
+                  _emit('RequestCount', {'TableId': table_id, 'TrafficType': traffic_type, 'Outcome': 'Denied'})
+                  return _response(403, {'approved': 'false', 'reason': reason})
+
+              if REQUIRED_SCOPE not in scope:
+                  return deny('missing_scope')
+
+              cfg = _get_table_config(table_id)
+
+              if cfg.get('block_all'):
+                  return deny('block_all')
+
+              if client_id in (cfg.get('blocked_clients') or []):
+                  return deny('blocked_client')
+
+              # Agent overrides may only tighten the service's own baseline,
+              # never loosen it - min() with the baseline keeps a floor.
+              effective_rps = BASELINE_RPS
+              agent_rps = cfg.get('rate_limit_rps')
+              if agent_rps is not None:
+                  effective_rps = min(effective_rps, agent_rps)
+              if not _check_and_increment_rate(table_id, client_id, effective_rps):
+                  return deny('rate_limited')
+
+              effective_max_age = BASELINE_MAX_TOKEN_AGE
+              agent_max_age = cfg.get('max_token_age_seconds')
+              if agent_max_age is not None:
+                  effective_max_age = agent_max_age if effective_max_age is None else min(effective_max_age, agent_max_age)
+              if effective_max_age is not None and issued_at:
+                  if time.time() - issued_at > effective_max_age:
+                      return deny('stale_token')
+
+              required_claim = cfg.get('required_claim')
+              if required_claim:
+                  name = required_claim.get('name')
+                  value = required_claim.get('value')
+                  match = required_claim.get('match', 'equals')
+                  actual = claims.get(name, '')
+                  ok = (value in actual) if match == 'contains' else (actual == value)
+                  if not ok:
+                      return deny('required_claim_failed')
+
+              _emit('RequestCount', {'TableId': table_id, 'TrafficType': traffic_type, 'Outcome': 'Allowed'})
+              return _response(200, {'approved': 'true', 'service': SERVICE_NAME})
+
+  Service2Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ServiceFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref StateTable
+          METRIC_NAMESPACE: ISC2/GatewayExercise
+          SERVICE_NAME: service2
+          BASELINE_RPS: '500'
+          BASELINE_MAX_TOKEN_AGE: '60'
+          REQUIRED_SCOPE: gateway/service2.access
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          STATE_TABLE = os.environ['STATE_TABLE_NAME']
+          NAMESPACE = os.environ['METRIC_NAMESPACE']
+          SERVICE_NAME = os.environ['SERVICE_NAME']
+          REQUIRED_SCOPE = os.environ['REQUIRED_SCOPE']
+          BASELINE_RPS = int(os.environ['BASELINE_RPS'])
+          _baseline_age = os.environ.get('BASELINE_MAX_TOKEN_AGE') or ''
+          BASELINE_MAX_TOKEN_AGE = int(_baseline_age) if _baseline_age else None
+
+          table = dynamodb.Table(STATE_TABLE)
+
+
+          def _get_table_config(table_id):
+              resp = table.get_item(Key={'pk': f'CFG#{table_id}'})
+              item = resp.get('Item')
+              if not item:
+                  return {}
+              return item.get('data') or {}
+
+
+          def _check_and_increment_rate(table_id, client_id, limit_rps):
+              bucket = int(time.time())
+              key = f'RATE#{table_id}#{client_id}#{bucket}'
+              resp = table.update_item(
+                  Key={'pk': key},
+                  UpdateExpression='ADD cnt :incr SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':incr': 1, ':ttl': bucket + 10},
+                  ReturnValues='UPDATED_NEW',
+              )
+              current = int(resp['Attributes']['cnt'])
+              return current <= limit_rps
+
+
+          def _emit(metric_name, dimensions):
+              cloudwatch.put_metric_data(
+                  Namespace=NAMESPACE,
+                  MetricData=[{
+                      'MetricName': metric_name,
+                      'Dimensions': [{'Name': k, 'Value': v} for k, v in dimensions.items()],
+                      'Value': 1,
+                      'Unit': 'Count',
+                  }],
+              )
+
+
+          def _response(status, body):
+              return {
+                  'statusCode': status,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps(body),
+              }
+
+
+          def handler(event, context):
+              headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
+              table_id = headers.get('x-table-id', 'unassigned')
+              traffic_type = 'Adversarial' if headers.get('x-adversarial') == 'true' else (
+                  'Good' if headers.get('x-expected') == 'true' else 'Unlabeled')
+
+              # Flat context from our custom TOKEN authorizer, not nested
+              # under .claims the way the native Cognito authorizer did.
+              claims = event.get('requestContext', {}).get('authorizer', {}) or {}
+              client_id = claims.get('client_id') or claims.get('sub', 'unknown')
+              scope = claims.get('scope', '')
+              issued_at = int(claims.get('iat', 0) or 0)
+
+              # Client-facing traffic instrumentation, kept in DynamoDB (not
+              # CloudWatch) so the blue agent's get_traffic_stats tool sees
+              # it sub-second-fresh with no metrics-indexing lag, and kept
+              # separate from the scoring metric below so it never carries
+              # the Good/Adversarial label - only real signals count.
+              _ttl = int(time.time()) + 3600  # safety-net expiry; reset_config
+                                               # deletes these explicitly too
+              table.update_item(
+                  Key={'pk': f'CLIENTS#{table_id}'},
+                  UpdateExpression='ADD ids :cid SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':cid': {client_id}, ':ttl': _ttl},
+              )
+              table.update_item(
+                  Key={'pk': f'STATS#{table_id}#{client_id}'},
+                  UpdateExpression='ADD cnt :one SET first_seen = if_not_exists(first_seen, :now), #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':one': 1, ':now': int(time.time()), ':ttl': _ttl},
+              )
+
+              def deny(reason):
+                  _emit('RequestCount', {'TableId': table_id, 'TrafficType': traffic_type, 'Outcome': 'Denied'})
+                  return _response(403, {'approved': 'false', 'reason': reason})
+
+              if REQUIRED_SCOPE not in scope:
+                  return deny('missing_scope')
+
+              cfg = _get_table_config(table_id)
+
+              if cfg.get('block_all'):
+                  return deny('block_all')
+
+              if client_id in (cfg.get('blocked_clients') or []):
+                  return deny('blocked_client')
+
+              # Agent overrides may only tighten the service's own baseline,
+              # never loosen it - min() with the baseline keeps a floor.
+              effective_rps = BASELINE_RPS
+              agent_rps = cfg.get('rate_limit_rps')
+              if agent_rps is not None:
+                  effective_rps = min(effective_rps, agent_rps)
+              if not _check_and_increment_rate(table_id, client_id, effective_rps):
+                  return deny('rate_limited')
+
+              effective_max_age = BASELINE_MAX_TOKEN_AGE
+              agent_max_age = cfg.get('max_token_age_seconds')
+              if agent_max_age is not None:
+                  effective_max_age = agent_max_age if effective_max_age is None else min(effective_max_age, agent_max_age)
+              if effective_max_age is not None and issued_at:
+                  if time.time() - issued_at > effective_max_age:
+                      return deny('stale_token')
+
+              required_claim = cfg.get('required_claim')
+              if required_claim:
+                  name = required_claim.get('name')
+                  value = required_claim.get('value')
+                  match = required_claim.get('match', 'equals')
+                  actual = claims.get(name, '')
+                  ok = (value in actual) if match == 'contains' else (actual == value)
+                  if not ok:
+                      return deny('required_claim_failed')
+
+              _emit('RequestCount', {'TableId': table_id, 'TrafficType': traffic_type, 'Outcome': 'Allowed'})
+              return _response(200, {'approved': 'true', 'service': SERVICE_NAME})
+
+  Service3Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ServiceFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref StateTable
+          METRIC_NAMESPACE: ISC2/GatewayExercise
+          SERVICE_NAME: service3
+          BASELINE_RPS: '200'
+          BASELINE_MAX_TOKEN_AGE: '30'
+          REQUIRED_SCOPE: gateway/service3.access
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          STATE_TABLE = os.environ['STATE_TABLE_NAME']
+          NAMESPACE = os.environ['METRIC_NAMESPACE']
+          SERVICE_NAME = os.environ['SERVICE_NAME']
+          REQUIRED_SCOPE = os.environ['REQUIRED_SCOPE']
+          BASELINE_RPS = int(os.environ['BASELINE_RPS'])
+          _baseline_age = os.environ.get('BASELINE_MAX_TOKEN_AGE') or ''
+          BASELINE_MAX_TOKEN_AGE = int(_baseline_age) if _baseline_age else None
+
+          table = dynamodb.Table(STATE_TABLE)
+
+
+          def _get_table_config(table_id):
+              resp = table.get_item(Key={'pk': f'CFG#{table_id}'})
+              item = resp.get('Item')
+              if not item:
+                  return {}
+              return item.get('data') or {}
+
+
+          def _check_and_increment_rate(table_id, client_id, limit_rps):
+              bucket = int(time.time())
+              key = f'RATE#{table_id}#{client_id}#{bucket}'
+              resp = table.update_item(
+                  Key={'pk': key},
+                  UpdateExpression='ADD cnt :incr SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':incr': 1, ':ttl': bucket + 10},
+                  ReturnValues='UPDATED_NEW',
+              )
+              current = int(resp['Attributes']['cnt'])
+              return current <= limit_rps
+
+
+          def _emit(metric_name, dimensions):
+              cloudwatch.put_metric_data(
+                  Namespace=NAMESPACE,
+                  MetricData=[{
+                      'MetricName': metric_name,
+                      'Dimensions': [{'Name': k, 'Value': v} for k, v in dimensions.items()],
+                      'Value': 1,
+                      'Unit': 'Count',
+                  }],
+              )
+
+
+          def _response(status, body):
+              return {
+                  'statusCode': status,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps(body),
+              }
+
+
+          def handler(event, context):
+              headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
+              table_id = headers.get('x-table-id', 'unassigned')
+              traffic_type = 'Adversarial' if headers.get('x-adversarial') == 'true' else (
+                  'Good' if headers.get('x-expected') == 'true' else 'Unlabeled')
+
+              # Flat context from our custom TOKEN authorizer, not nested
+              # under .claims the way the native Cognito authorizer did.
+              claims = event.get('requestContext', {}).get('authorizer', {}) or {}
+              client_id = claims.get('client_id') or claims.get('sub', 'unknown')
+              scope = claims.get('scope', '')
+              issued_at = int(claims.get('iat', 0) or 0)
+
+              # Client-facing traffic instrumentation, kept in DynamoDB (not
+              # CloudWatch) so the blue agent's get_traffic_stats tool sees
+              # it sub-second-fresh with no metrics-indexing lag, and kept
+              # separate from the scoring metric below so it never carries
+              # the Good/Adversarial label - only real signals count.
+              _ttl = int(time.time()) + 3600  # safety-net expiry; reset_config
+                                               # deletes these explicitly too
+              table.update_item(
+                  Key={'pk': f'CLIENTS#{table_id}'},
+                  UpdateExpression='ADD ids :cid SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':cid': {client_id}, ':ttl': _ttl},
+              )
+              table.update_item(
+                  Key={'pk': f'STATS#{table_id}#{client_id}'},
+                  UpdateExpression='ADD cnt :one SET first_seen = if_not_exists(first_seen, :now), #ttl = :ttl',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={':one': 1, ':now': int(time.time()), ':ttl': _ttl},
+              )
+
+              def deny(reason):
+                  _emit('RequestCount', {'TableId': table_id, 'TrafficType': traffic_type, 'Outcome': 'Denied'})
+                  return _response(403, {'approved': 'false', 'reason': reason})
+
+              if REQUIRED_SCOPE not in scope:
+                  return deny('missing_scope')
+
+              cfg = _get_table_config(table_id)
+
+              if cfg.get('block_all'):
+                  return deny('block_all')
+
+              if client_id in (cfg.get('blocked_clients') or []):
+                  return deny('blocked_client')
+
+              # Agent overrides may only tighten the service's own baseline,
+              # never loosen it - min() with the baseline keeps a floor.
+              effective_rps = BASELINE_RPS
+              agent_rps = cfg.get('rate_limit_rps')
+              if agent_rps is not None:
+                  effective_rps = min(effective_rps, agent_rps)
+              if not _check_and_increment_rate(table_id, client_id, effective_rps):
+                  return deny('rate_limited')
+
+              effective_max_age = BASELINE_MAX_TOKEN_AGE
+              agent_max_age = cfg.get('max_token_age_seconds')
+              if agent_max_age is not None:
+                  effective_max_age = agent_max_age if effective_max_age is None else min(effective_max_age, agent_max_age)
+              if effective_max_age is not None and issued_at:
+                  if time.time() - issued_at > effective_max_age:
+                      return deny('stale_token')
+
+              required_claim = cfg.get('required_claim')
+              if required_claim:
+                  name = required_claim.get('name')
+                  value = required_claim.get('value')
+                  match = required_claim.get('match', 'equals')
+                  actual = claims.get(name, '')
+                  ok = (value in actual) if match == 'contains' else (actual == value)
+                  if not ok:
+                      return deny('required_claim_failed')
+
+              _emit('RequestCount', {'TableId': table_id, 'TrafficType': traffic_type, 'Outcome': 'Allowed'})
+              return _response(200, {'approved': 'true', 'service': SERVICE_NAME})
+
+  # One Permission per service covers the {proxy+} method (SourceArn
+  # ending in "/service<N>/*" - requires that literal trailing slash);
+  # a SEPARATE Permission is needed for the new bare-resource
+  # Service<N>RootMethod above, whose method ARN is exactly
+  # ".../service<N>" with no trailing slash at all - "/service<N>/*"
+  # does NOT match that (IAM ARN wildcard matching needs the literal
+  # "/" to be present in the invoked ARN, not just implied by the
+  # glob), so without this, the bare-resource method would route
+  # correctly but get an AccessDenied invoking the Lambda - confirmed
+  # by checking IAM's actual glob semantics, not assumed.
+  Service1Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Service1Function
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/service1/*
+  Service1RootPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Service1Function
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/service1
+  Service2Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Service2Function
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/service2/*
+  Service2RootPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Service2Function
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/service2
+  Service3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Service3Function
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/service3/*
+  Service3RootPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Service3Function
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/service3
+
+  # ---------------------------------------------------------------------
+  # TriggerAgentFunction: thin trigger invoked by the survey-tool webhook
+  # (or facilitator CLI). Fires the Orchestrator asynchronously since even
+  # a 60s round is far past the API Gateway 29s integration cap.
+  # ---------------------------------------------------------------------
+  TriggerAgentFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: trigger-agent-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt OrchestratorFunction.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  TriggerAgentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TriggerAgentFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          ORCHESTRATOR_FUNCTION_NAME: !Ref OrchestratorFunction
+      Code:
+        ZipFile: |
+          import json, os, boto3
+
+          lambda_client = boto3.client('lambda')
+          ORCHESTRATOR_FUNCTION_NAME = os.environ['ORCHESTRATOR_FUNCTION_NAME']
+
+
+          def handler(event, context):
+              try:
+                  payload = json.loads(event.get('body') or '{}')
+              except json.JSONDecodeError:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'invalid_json'})}
+
+              table_id = payload.get('table_id')
+              prompt = payload.get('prompt')
+              if not table_id or not prompt:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'table_id and prompt are required'})}
+
+              invoke_payload = {'table_id': str(table_id), 'prompt': prompt}
+              # Optional override - handler.py's own DEFAULT_ROUND_SECONDS
+              # fallback (60s, the event's round length) applies when
+              # this is omitted.
+              round_seconds = payload.get('round_seconds')
+              if round_seconds is not None:
+                  invoke_payload['round_seconds'] = int(round_seconds)
+
+              lambda_client.invoke(
+                  FunctionName=ORCHESTRATOR_FUNCTION_NAME,
+                  InvocationType='Event',
+                  Payload=json.dumps(invoke_payload).encode('utf-8'),
+              )
+              return {'statusCode': 202, 'body': json.dumps({'status': 'round_started', 'table_id': table_id})}
+
+  TriggerAgentPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerAgentFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/trigger-agent
+
+  # ---------------------------------------------------------------------
+  # EndRoundFunction: the deterministic end-of-round signal (see
+  # scripts/end_round.sh). Invokes the Orchestrator SYNCHRONOUSLY
+  # (RequestResponse, unlike TriggerAgentFunction's Event invoke above) -
+  # the caller needs to know the config reset actually happened before
+  # moving on to verify_config_reset, not just that the request was
+  # accepted. reset_config() itself is a couple of DynamoDB calls, so
+  # this comfortably fits well inside API Gateway's 29s integration cap.
+  # ---------------------------------------------------------------------
+  EndRoundFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: end-round-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt OrchestratorFunction.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  EndRoundFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EndRoundFunctionRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          ORCHESTRATOR_FUNCTION_NAME: !Ref OrchestratorFunction
+      Code:
+        ZipFile: |
+          import json, os, boto3
+
+          lambda_client = boto3.client('lambda')
+          ORCHESTRATOR_FUNCTION_NAME = os.environ['ORCHESTRATOR_FUNCTION_NAME']
+
+
+          def handler(event, context):
+              try:
+                  payload = json.loads(event.get('body') or '{}')
+              except json.JSONDecodeError:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'invalid_json'})}
+
+              table_id = payload.get('table_id')
+              if not table_id:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'table_id is required'})}
+
+              resp = lambda_client.invoke(
+                  FunctionName=ORCHESTRATOR_FUNCTION_NAME,
+                  InvocationType='RequestResponse',
+                  Payload=json.dumps({'action': 'end_round', 'table_id': str(table_id)}).encode('utf-8'),
+              )
+              result_payload = json.loads(resp['Payload'].read())
+              if resp.get('FunctionError'):
+                  return {'statusCode': 502, 'body': json.dumps({'error': 'orchestrator_error', 'detail': result_payload})}
+              return {'statusCode': 200, 'body': json.dumps({'status': 'round_ended', 'table_id': table_id, 'reset_result': result_payload})}
+
+  EndRoundPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EndRoundFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GatewayApi}/*/*/end-round
+
+  # ---------------------------------------------------------------------
+  # OrchestratorFunction: the "blue agent". Packaged separately (it needs
+  # the anthropic SDK) - see scripts/build_lambdas.sh + scripts/deploy.sh,
+  # which run `aws cloudformation package` to upload build/orchestrator.zip.
+  # ---------------------------------------------------------------------
+  OrchestratorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orchestrator-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: cognito-idp:UpdateUserPoolClient
+                Resource: !GetAtt UserPool.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+              # Bedrock invoke, in place of a direct Anthropic API key - covers
+              # both a plain foundation-model ARN and a cross-region inference
+              # profile ARN, since ModelId may be either depending on region.
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/anthropic.*
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt OrchestratorFunctionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code: build/orchestrator.zip
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref StateTable
+          MODEL_ID: !Ref ModelId
+          USER_POOL_ID: !Ref UserPool
+          GOOD_CLIENT_ID: !Ref GoodClient
+          ADVERSARIAL_CLIENT_ID: !Ref AdversarialClient
+          ROUND_SECONDS: '60'
+
+  # ---------------------------------------------------------------------
+  # Explicit log groups for every Lambda, instead of relying on the ones
+  # Lambda auto-creates on first invocation. Two reasons: (1) an
+  # auto-created log group is NOT a stack resource, so it does not
+  # inherit the stack-level Tags below - it would be invisible to a
+  # "Project"/"Project_Run" cost-allocation-tag filter even though it's
+  # part of this project's spend; (2) auto-created log groups default to
+  # "Never expire" retention, a silent, unbounded cost creep.
+  #
+  # This list previously missed JwtAuthorizerFunction (6 Lambdas in this
+  # stack, only 5 explicit groups) - confirmed live: 5 untagged, never-
+  # expiring orphaned log groups had accumulated across past deploy/
+  # teardown cycles, invisible to check_tags.sh (its tag-based Pass 1
+  # can't see untagged resources, and Pass 2's name-based sweep never
+  # scanned CloudWatch Logs at all - both gaps, now fixed).
+  #
+  # Then missed EndRoundFunction the same way (7 Lambdas, still only 6
+  # explicit groups until this comment) - the exact same bug recurring on
+  # a later-added Lambda. RetentionInDays: 1 (not 14) on every group
+  # here, consistently - the shortest native CloudWatch Logs supports;
+  # there is no sub-day retention setting in the API at all, so this is
+  # the real floor, not an arbitrary choice.
+  # ---------------------------------------------------------------------
+  JwtAuthorizerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${JwtAuthorizerFunction}
+      RetentionInDays: 1
+  Service1LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Service1Function}
+      RetentionInDays: 1
+  Service2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Service2Function}
+      RetentionInDays: 1
+  Service3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Service3Function}
+      RetentionInDays: 1
+  TriggerAgentFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TriggerAgentFunction}
+      RetentionInDays: 1
+  EndRoundFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EndRoundFunction}
+      RetentionInDays: 1
+  OrchestratorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OrchestratorFunction}
+      RetentionInDays: 1
+  # API Gateway's own execution logs (authorizer invocation/response,
+  # integration latency, method completion) - a DIFFERENT log group than
+  # any single Lambda's, auto-named by AWS in this exact format. Declared
+  # explicitly for the same two reasons as the Lambda groups above (cost-
+  # allocation tagging, bounded retention) plus a third: this is what we
+  # actually need to see WHERE a request got rejected when it never
+  # reaches any Lambda at all - confirmed live, a real round had 3
+  # adversarial requests 403 with API Gateway's own SigV4-parsing error
+  # text, indistinguishable from our own Lambdas' behavior until this
+  # exists. LoggingLevel INFO (not the full DataTraceEnabled request/
+  # response dump) - enough to see authorizer-flow decisions without
+  # writing real bearer tokens into CloudWatch Logs.
+  ApiGatewayExecutionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "API-Gateway-Execution-Logs_${GatewayApi}/prod"
+      RetentionInDays: 1
+
+  # ---------------------------------------------------------------------
+  # Dashboard: score = RUNNING_SUM(adversarial_denied) -
+  # RUNNING_SUM(good_denied), per table - a cumulative running total:
+  # +1 for every adversarial request blocked, -1 for every good request
+  # blocked, nothing else. No baseline/target-rate term: docs/proposal.md's
+  # original formula (N_x_baseline - N_x_attempt, i.e. N_x_denied) was
+  # already exactly this once reduced algebraically - a per-minute,
+  # rate-vs-baseline version of this widget shipped first and was wrong
+  # (dimensionally incoherent: comparing a whole-round constant against
+  # one minute's count), confirmed by testing against a real deployed
+  # table and seeing every minute render an identical, clearly-impossible
+  # score. Fixed to this simpler, more accurate, and self-evidently
+  # correct form: a no-op defense that blocks nothing scores exactly 0;
+  # a defense that blocks everything scores deeply negative - see
+  # scripts/lib/scoring.py's docstring for the full reasoning, and
+  # DEPLOYMENT.md's "Scoring" section for the facilitator-facing summary.
+  #
+  # Every widget below enumerates TableId "1".."12" explicitly with the
+  # classic exact-dimension metric syntax (Namespace, MetricName, and all
+  # three published dimensions), rather than a CloudWatch SEARCH()
+  # expression. With a small, fixed, known set of tables this is more
+  # verbose but removes any doubt about how CloudWatch aligns two
+  # independently-faceted SEARCH results when computing the score's
+  # arithmetic - correctness over cleverness for what's the primary
+  # facilitator-facing, prize-determining view of the whole event.
+  # If your tables use different labels than "1".."12", regenerate this
+  # block (see the review notes / git history for the generator script)
+  # rather than hand-editing 60+ metric entries.
+  # ---------------------------------------------------------------------
+  ScoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-scoring
+      DashboardBody: !Sub |
+        {"widgets":[{"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"## ISC2 Gateway Exercise \u2014 live scoring\nOne line per table (1-12). Score = cumulative running total: +1 for every adversarial request blocked, -1 for every good request blocked. A no-op defense scores 0; blocking everything scores deeply negative. Toggle legend entries to isolate the currently-active table(s)."}},{"type":"metric","x":0,"y":2,"width":12,"height":6,"properties":{"title":"Allowed good traffic, per table (last 5 min)","view":"timeSeries","region":"${AWS::Region}","period":60,"stacked":false,"metrics":[["ISC2/GatewayExercise","RequestCount","TableId","1","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga1","label":"Table 1"}],["ISC2/GatewayExercise","RequestCount","TableId","2","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga2","label":"Table 2"}],["ISC2/GatewayExercise","RequestCount","TableId","3","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga3","label":"Table 3"}],["ISC2/GatewayExercise","RequestCount","TableId","4","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga4","label":"Table 4"}],["ISC2/GatewayExercise","RequestCount","TableId","5","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga5","label":"Table 5"}],["ISC2/GatewayExercise","RequestCount","TableId","6","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga6","label":"Table 6"}],["ISC2/GatewayExercise","RequestCount","TableId","7","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga7","label":"Table 7"}],["ISC2/GatewayExercise","RequestCount","TableId","8","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga8","label":"Table 8"}],["ISC2/GatewayExercise","RequestCount","TableId","9","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga9","label":"Table 9"}],["ISC2/GatewayExercise","RequestCount","TableId","10","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga10","label":"Table 10"}],["ISC2/GatewayExercise","RequestCount","TableId","11","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga11","label":"Table 11"}],["ISC2/GatewayExercise","RequestCount","TableId","12","TrafficType","Good","Outcome","Allowed",{"stat":"Sum","id":"mga12","label":"Table 12"}]]}},{"type":"metric","x":12,"y":2,"width":12,"height":6,"properties":{"title":"Allowed adversarial traffic, per table (last 5 min)","view":"timeSeries","region":"${AWS::Region}","period":60,"stacked":false,"metrics":[["ISC2/GatewayExercise","RequestCount","TableId","1","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa1","label":"Table 1"}],["ISC2/GatewayExercise","RequestCount","TableId","2","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa2","label":"Table 2"}],["ISC2/GatewayExercise","RequestCount","TableId","3","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa3","label":"Table 3"}],["ISC2/GatewayExercise","RequestCount","TableId","4","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa4","label":"Table 4"}],["ISC2/GatewayExercise","RequestCount","TableId","5","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa5","label":"Table 5"}],["ISC2/GatewayExercise","RequestCount","TableId","6","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa6","label":"Table 6"}],["ISC2/GatewayExercise","RequestCount","TableId","7","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa7","label":"Table 7"}],["ISC2/GatewayExercise","RequestCount","TableId","8","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa8","label":"Table 8"}],["ISC2/GatewayExercise","RequestCount","TableId","9","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa9","label":"Table 9"}],["ISC2/GatewayExercise","RequestCount","TableId","10","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa10","label":"Table 10"}],["ISC2/GatewayExercise","RequestCount","TableId","11","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa11","label":"Table 11"}],["ISC2/GatewayExercise","RequestCount","TableId","12","TrafficType","Adversarial","Outcome","Allowed",{"stat":"Sum","id":"maa12","label":"Table 12"}]]}},{"type":"metric","x":0,"y":8,"width":12,"height":6,"properties":{"title":"Denied good traffic, per table (last 5 min)","view":"timeSeries","region":"${AWS::Region}","period":60,"stacked":false,"metrics":[["ISC2/GatewayExercise","RequestCount","TableId","1","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd1","label":"Table 1"}],["ISC2/GatewayExercise","RequestCount","TableId","2","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd2","label":"Table 2"}],["ISC2/GatewayExercise","RequestCount","TableId","3","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd3","label":"Table 3"}],["ISC2/GatewayExercise","RequestCount","TableId","4","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd4","label":"Table 4"}],["ISC2/GatewayExercise","RequestCount","TableId","5","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd5","label":"Table 5"}],["ISC2/GatewayExercise","RequestCount","TableId","6","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd6","label":"Table 6"}],["ISC2/GatewayExercise","RequestCount","TableId","7","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd7","label":"Table 7"}],["ISC2/GatewayExercise","RequestCount","TableId","8","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd8","label":"Table 8"}],["ISC2/GatewayExercise","RequestCount","TableId","9","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd9","label":"Table 9"}],["ISC2/GatewayExercise","RequestCount","TableId","10","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd10","label":"Table 10"}],["ISC2/GatewayExercise","RequestCount","TableId","11","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd11","label":"Table 11"}],["ISC2/GatewayExercise","RequestCount","TableId","12","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"mgd12","label":"Table 12"}]]}},{"type":"metric","x":12,"y":8,"width":12,"height":6,"properties":{"title":"Denied adversarial traffic, per table (last 5 min)","view":"timeSeries","region":"${AWS::Region}","period":60,"stacked":false,"metrics":[["ISC2/GatewayExercise","RequestCount","TableId","1","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad1","label":"Table 1"}],["ISC2/GatewayExercise","RequestCount","TableId","2","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad2","label":"Table 2"}],["ISC2/GatewayExercise","RequestCount","TableId","3","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad3","label":"Table 3"}],["ISC2/GatewayExercise","RequestCount","TableId","4","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad4","label":"Table 4"}],["ISC2/GatewayExercise","RequestCount","TableId","5","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad5","label":"Table 5"}],["ISC2/GatewayExercise","RequestCount","TableId","6","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad6","label":"Table 6"}],["ISC2/GatewayExercise","RequestCount","TableId","7","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad7","label":"Table 7"}],["ISC2/GatewayExercise","RequestCount","TableId","8","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad8","label":"Table 8"}],["ISC2/GatewayExercise","RequestCount","TableId","9","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad9","label":"Table 9"}],["ISC2/GatewayExercise","RequestCount","TableId","10","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad10","label":"Table 10"}],["ISC2/GatewayExercise","RequestCount","TableId","11","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad11","label":"Table 11"}],["ISC2/GatewayExercise","RequestCount","TableId","12","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"mad12","label":"Table 12"}]]}},{"type":"metric","x":0,"y":14,"width":24,"height":8,"properties":{"title":"Cumulative score per table (running total: +1/adversarial blocked, -1/good blocked)","view":"timeSeries","region":"${AWS::Region}","period":60,"metrics":[["ISC2/GatewayExercise","RequestCount","TableId","1","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd1","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","1","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad1","visible":false}],[{"expression":"RUNNING_SUM(ad1) - RUNNING_SUM(gd1)","label":"Table 1 score","id":"score1"}],["ISC2/GatewayExercise","RequestCount","TableId","2","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd2","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","2","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad2","visible":false}],[{"expression":"RUNNING_SUM(ad2) - RUNNING_SUM(gd2)","label":"Table 2 score","id":"score2"}],["ISC2/GatewayExercise","RequestCount","TableId","3","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd3","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","3","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad3","visible":false}],[{"expression":"RUNNING_SUM(ad3) - RUNNING_SUM(gd3)","label":"Table 3 score","id":"score3"}],["ISC2/GatewayExercise","RequestCount","TableId","4","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd4","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","4","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad4","visible":false}],[{"expression":"RUNNING_SUM(ad4) - RUNNING_SUM(gd4)","label":"Table 4 score","id":"score4"}],["ISC2/GatewayExercise","RequestCount","TableId","5","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd5","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","5","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad5","visible":false}],[{"expression":"RUNNING_SUM(ad5) - RUNNING_SUM(gd5)","label":"Table 5 score","id":"score5"}],["ISC2/GatewayExercise","RequestCount","TableId","6","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd6","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","6","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad6","visible":false}],[{"expression":"RUNNING_SUM(ad6) - RUNNING_SUM(gd6)","label":"Table 6 score","id":"score6"}],["ISC2/GatewayExercise","RequestCount","TableId","7","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd7","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","7","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad7","visible":false}],[{"expression":"RUNNING_SUM(ad7) - RUNNING_SUM(gd7)","label":"Table 7 score","id":"score7"}],["ISC2/GatewayExercise","RequestCount","TableId","8","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd8","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","8","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad8","visible":false}],[{"expression":"RUNNING_SUM(ad8) - RUNNING_SUM(gd8)","label":"Table 8 score","id":"score8"}],["ISC2/GatewayExercise","RequestCount","TableId","9","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd9","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","9","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad9","visible":false}],[{"expression":"RUNNING_SUM(ad9) - RUNNING_SUM(gd9)","label":"Table 9 score","id":"score9"}],["ISC2/GatewayExercise","RequestCount","TableId","10","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd10","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","10","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad10","visible":false}],[{"expression":"RUNNING_SUM(ad10) - RUNNING_SUM(gd10)","label":"Table 10 score","id":"score10"}],["ISC2/GatewayExercise","RequestCount","TableId","11","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd11","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","11","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad11","visible":false}],[{"expression":"RUNNING_SUM(ad11) - RUNNING_SUM(gd11)","label":"Table 11 score","id":"score11"}],["ISC2/GatewayExercise","RequestCount","TableId","12","TrafficType","Good","Outcome","Denied",{"stat":"Sum","id":"gd12","visible":false}],["ISC2/GatewayExercise","RequestCount","TableId","12","TrafficType","Adversarial","Outcome","Denied",{"stat":"Sum","id":"ad12","visible":false}],[{"expression":"RUNNING_SUM(ad12) - RUNNING_SUM(gd12)","label":"Table 12 score","id":"score12"}]]}}]}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${GatewayApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+  StateTableName:
+    Value: !Ref StateTable
+  UserPoolId:
+    Value: !Ref UserPool
+  CognitoTokenEndpoint:
+    Value: !Sub https://isc2-gw-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+  GoodClientId:
+    Value: !Ref GoodClient
+  AdversarialClientId:
+    Value: !Ref AdversarialClient
+  FacilitatorApiKeyId:
+    Value: !Ref FacilitatorApiKey
+  DashboardUrl:
+    Value: !Sub https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-scoring

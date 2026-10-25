@@ -1,0 +1,11 @@
+# Pinned exact version (checked via `pip index versions anthropic`, a
+# fast metadata-only query, not a full resolve) - left unpinned, pip's
+# resolver has to consider all 175+ historical anthropic releases to find
+# one whose old transitive deps (ancient boto3/six) satisfy everything
+# else, causing multi-minute-plus backtracking (confirmed live: 15+ min
+# stuck on exactly this before pinning). Bump deliberately, not blindly -
+# re-run `pip index versions anthropic` and re-verify the build succeeds
+# before changing this.
+# [bedrock] extra pulls in boto3/botocore for AnthropicBedrock - invoked
+# via Amazon Bedrock, not the direct Anthropic API, so no API key needed.
+anthropic[bedrock]==0.125.0

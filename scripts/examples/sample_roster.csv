@@ -1,0 +1,4 @@
+table_id,prompt
+1,"Watch for clients whose request pattern looks scripted or unusually regular; leave everything else alone."
+2,"Be conservative - only block a client once you have strong evidence, false positives against good traffic are costly."
+3,"Be aggressive - tighten rate limits and token freshness early, then ease off only if good traffic looks hurt."

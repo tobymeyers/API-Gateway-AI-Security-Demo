@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: ISC2 Gateway Exercise API
+  version: "1.0"
+  description: >
+    Three backend services behind one API Gateway, each with different
+    secondary-auth strictness. Every request must carry a valid Cognito
+    M2M access token (client_credentials grant) with the matching scope.
+    Each service is a catch-all proxy integration (API Gateway {proxy+}
+    resource, HttpMethod: ANY) - the Lambda behind it makes its allow/deny
+    decision purely from the request's token claims and headers (table_id,
+    rate limit, token age, required claim), never from the HTTP method or
+    the specific sub-path. GET and POST are shown below as illustrative
+    examples; every method and every sub-path under a service behaves
+    identically.
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/prod
+    variables:
+      apiId: {default: example}
+      region: {default: us-east-1}
+security:
+  - cognitoOAuth2: []
+paths:
+  /service1/{proxy}:
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      summary: Service 1 - limited secondary auth
+      description: >
+        Baseline strictness: any request with a valid, unexpired,
+        correctly-scoped token is approved. No token-age or claim checks.
+      responses:
+        "200": {description: approved}
+        "403": {description: denied}
+    post:
+      summary: Service 1 - limited secondary auth
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: approved}
+        "403": {description: denied}
+  /service2/{proxy}:
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      summary: Service 2 - moderate secondary auth
+      description: >
+        Requires a token issued within the last 60 seconds by default,
+        in addition to a valid scope.
+      responses:
+        "200": {description: approved}
+        "403": {description: denied}
+    post:
+      summary: Service 2 - moderate secondary auth
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: approved}
+        "403": {description: denied}
+  /service3/{proxy}:
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      summary: Service 3 - extreme secondary auth
+      description: >
+        Requires a token issued within the last 30 seconds by default,
+        the tightest per-table-id rate ceiling of the three services,
+        and is the most likely to be additionally hardened live by the
+        defensive agent during a round.
+      responses:
+        "200": {description: approved}
+        "403": {description: denied}
+    post:
+      summary: Service 3 - extreme secondary auth
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: approved}
+        "403": {description: denied}
+components:
+  securitySchemes:
+    cognitoOAuth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://{domain}.auth.{region}.amazoncognito.com/oauth2/token
+          scopes:
+            gateway/service1.access: Access to Service 1
+            gateway/service2.access: Access to Service 2
+            gateway/service3.access: Access to Service 3
